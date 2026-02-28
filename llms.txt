@@ -1,0 +1,235 @@
+# Kanban Board API
+
+> Multi-project kanban board with markdown file storage and project briefs
+
+Base URL: https://kanban.repo.box
+
+## Authentication
+
+All endpoints require authentication via cookie or header:
+- Cookie: `kanban_token=<token>`
+- Header: `X-Auth-Token: <token>`
+
+Get a magic link from an admin to authenticate.
+
+## Project Briefs
+
+Project briefs are markdown documents that capture project context, resources, and history. They're stored in `/home/xiko/clawd/memory/projects/<project>.md`.
+
+### Get Project Brief
+
+```
+GET /api/projects/:project/brief
+```
+
+Returns:
+```json
+{
+  "content": "# Project: Name\n\n> Description\n\n## Resources\n...",
+  "exists": true
+}
+```
+
+If no brief exists, returns a pre-filled template with `exists: false`.
+
+### Update Project Brief
+
+```
+PUT /api/projects/:project/brief
+Content-Type: application/json
+
+{
+  "content": "# Project: Name\n\n..."
+}
+```
+
+Returns: `{ "ok": true }`
+
+### Brief Template Structure
+
+```markdown
+# Project: [NAME]
+
+> One-line description
+
+## Status
+- **Phase**: ideation | building | launched | paused | archived
+- **Last touched**: YYYY-MM-DD
+- **Next action**: What needs to happen next
+
+## Resources
+
+### Domains & URLs
+- **Live**: https://...
+- **Staging**: https://...
+- **Repo**: https://github.com/...
+
+### Accounts & Services
+- **Vercel**: project name
+- **Cloudflare**: zone ID
+- **PM2**: process name
+
+### API Keys & Secrets
+- Location: ~/clawd/secrets/...
+
+### Local Paths
+- Source: ~/...
+- Config: ...
+
+## Tech Stack
+- Frontend: 
+- Backend: 
+- Database: 
+- Hosting: 
+
+## Key Decisions
+<!-- Major architectural or product decisions with rationale -->
+
+## History
+<!-- Reverse chronological - newest first -->
+### YYYY-MM-DD
+- What happened
+
+## Related
+- Kanban: PROJECT-XXX tasks
+- People: who's involved
+```
+
+## Kanban API
+
+### Get Board Data
+
+```
+GET /api/projects/:project/kanban
+```
+
+Returns columns with tasks:
+```json
+{
+  "columns": [
+    {
+      "id": "ideas",
+      "title": "💡 Ideas",
+      "tasks": [
+        {
+          "id": "TASK-001",
+          "title": "Task title",
+          "priority": "P1",
+          "tags": ["tag1"],
+          "description": "...",
+          "history": [...]
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Get Raw Markdown
+
+```
+GET /api/projects/:project/kanban/raw
+```
+
+Returns the raw markdown file content.
+
+### Move Task
+
+```
+POST /api/projects/:project/kanban/move
+Content-Type: application/json
+
+{
+  "taskId": "TASK-001",
+  "fromColumn": "💡 Ideas",
+  "toColumn": "📋 Backlog",
+  "position": 0
+}
+```
+
+### Create Task
+
+```
+POST /api/projects/:project/tasks
+Content-Type: application/json
+
+{
+  "column": "📋 Backlog",
+  "title": "Task title",
+  "priority": "P2",
+  "tags": ["tag1", "tag2"],
+  "description": "Optional description"
+}
+```
+
+### Update Task
+
+```
+PUT /api/projects/:project/tasks/:id
+Content-Type: application/json
+
+{
+  "title": "Updated title",
+  "priority": "P1",
+  "tags": ["updated"],
+  "description": "Updated description"
+}
+```
+
+### Delete Task
+
+```
+DELETE /api/projects/:project/tasks/:id
+```
+
+## Users & Permissions
+
+### List Users (admin only)
+
+```
+GET /api/users
+```
+
+### Create User (admin only)
+
+```
+POST /api/users
+Content-Type: application/json
+
+{
+  "id": "username",
+  "name": "Display Name",
+  "email": "optional@email.com"
+}
+```
+
+Returns magic link for the new user.
+
+### Get Project Permissions
+
+```
+GET /api/projects/:project/permissions
+```
+
+### Set User Permission
+
+```
+PUT /api/projects/:project/permissions/:userId
+Content-Type: application/json
+
+{
+  "permission": "viewer" | "editor" | "admin" | null
+}
+```
+
+## Current Projects
+
+- `clawd` - Meta workspace, agent infrastructure
+- `cabin` - AI group travel agent
+- `kanban` - This kanban board
+- `rikai` - Language reading assistant
+- `agentation` - Visual feedback tool
+- `streme` - Superfluid token launcher
+- `flow3d` - The Pulse game
+- `supstrategy` - Trading strategy system
+- `botfight` - AI social deduction arena
