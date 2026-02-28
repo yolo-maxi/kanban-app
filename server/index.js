@@ -1,8 +1,10 @@
 const express = require('express');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 const cors = require('cors');
 const crypto = require('crypto');
+const { createWriteStream } = require('fs');
 
 const app = express();
 const PORT = 3400;
@@ -35,7 +37,19 @@ const USERS_PATH = path.join(DATA_DIR, 'users.json');
 const PROJECTS_PATH = path.join(DATA_DIR, 'projects.json');
 const KANBAN_DIR = '/home/xiko/kanban-projects';  // Auto-created project files go here
 
-app.use(cors());
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || 'https://kanban.repo.box')
+  .split(',')
+  .map(v => v.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true); // same-origin/server-to-server/curl
+    if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return cb(null, true);
+    return cb(new Error('CORS origin not allowed'));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 // ============ DATA HELPERS ============
@@ -54,12 +68,46 @@ async function saveUsers(data) {
 }
 
 async function loadProjects() {
+  let projectsData;
   try {
     const data = await fs.readFile(PROJECTS_PATH, 'utf8');
-    return JSON.parse(data);
+    projectsData = JSON.parse(data);
   } catch {
-    return { projects: {} };
+    projectsData = { projects: {} };
   }
+
+  // Auto-discover .md files in KANBAN_DIR not yet registered
+  try {
+    const files = await fs.readdir(KANBAN_DIR);
+    let dirty = false;
+    for (const file of files) {
+      if (!file.endsWith('.md')) continue;
+      const id = file.replace(/\.md$/, '');
+      if (projectsData.projects[id]) continue;
+      // Auto-register with sensible defaults
+      const name = id.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+      // Grant all admin users access by default
+      const usersData = JSON.parse(await fs.readFile(USERS_PATH, 'utf8').catch(() => '{"users":{}}'));
+      const perms = {};
+      for (const [uid, u] of Object.entries(usersData.users || {})) {
+        if (u.role === 'admin') perms[uid] = 'admin';
+      }
+      projectsData.projects[id] = {
+        name,
+        file: path.join(KANBAN_DIR, file),
+        owner: Object.keys(perms)[0] || 'admin',
+        permissions: perms,
+        createdAt: Date.now()
+      };
+      dirty = true;
+      console.log(`[auto-index] Registered new board: ${id} (${file})`);
+    }
+    if (dirty) await saveProjects(projectsData);
+  } catch (err) {
+    console.error('[auto-index] Failed to scan KANBAN_DIR:', err.message);
+  }
+
+  return projectsData;
 }
 
 async function saveProjects(data) {
@@ -70,16 +118,21 @@ function generateToken() {
   return crypto.randomBytes(24).toString('base64url');
 }
 
-// ============ AUTH MIDDLEWARE ============
-
-async function authMiddleware(req, res, next) {
-  // Get token from header, query, or cookie
-  const token = req.headers['x-auth-token'] || req.query.token;
+function extractAuthToken(req) {
+  const allowQuery = String(process.env.ALLOW_QUERY_TOKEN_AUTH || '').toLowerCase() === 'true';
+  const headerToken = req.headers['x-auth-token'];
+  const queryToken = allowQuery ? req.query.token : undefined;
   const cookieToken = req.headers.cookie?.split(';')
     .find(c => c.trim().startsWith('kanban_token='))
     ?.split('=')[1];
-  
-  const authToken = token || cookieToken;
+
+  return headerToken || queryToken || cookieToken;
+}
+
+// ============ AUTH MIDDLEWARE ============
+
+async function authMiddleware(req, res, next) {
+  const authToken = extractAuthToken(req);
   
   if (!authToken) {
     return res.status(401).json({ error: 'No token provided' });
@@ -1013,16 +1066,13 @@ app.put('/api/projects/:project/brief', authMiddleware, async (req, res) => {
 
 // These use the old single-file approach for backward compatibility
 const LEGACY_KANBAN = process.env.KANBAN_PATH || '/home/xiko/clawd/kanban.md';
-const LEGACY_TOKEN = process.env.KANBAN_TOKEN || 'kanban-dev-token';
+const LEGACY_TOKEN = process.env.KANBAN_TOKEN;
 
 // Legacy auth check (for old tokens)
 function legacyAuthMiddleware(req, res, next) {
-  const token = req.headers['x-auth-token'] || req.query.token;
-  const cookieToken = req.headers.cookie?.split(';')
-    .find(c => c.trim().startsWith('kanban_token='))
-    ?.split('=')[1];
-  
-  if (token === LEGACY_TOKEN || cookieToken === LEGACY_TOKEN) {
+  const token = extractAuthToken(req);
+
+  if (LEGACY_TOKEN && token === LEGACY_TOKEN) {
     req.user = { id: 'fran', name: 'Fran (legacy)', role: 'admin' };
     return next();
   }
@@ -1137,6 +1187,365 @@ app.post('/api/tasks', legacyAuthMiddleware, async (req, res) => {
     
     await fs.writeFile(LEGACY_KANBAN, content);
     res.json({ ok: true, taskId: taskIdStr });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============ REVIEW MODE API ============
+
+const CHATS_DIR = path.join(__dirname, 'data/chats');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+
+// Ensure dirs exist
+fsSync.mkdirSync(CHATS_DIR, { recursive: true });
+fsSync.mkdirSync(UPLOADS_DIR, { recursive: true });
+
+// Serve uploaded images
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// GET /api/reviews — all tasks in Review column across all projects
+app.get('/api/reviews', authMiddleware, async (req, res) => {
+  try {
+    const projectsData = await loadProjects();
+    const reviews = [];
+    
+    for (const [projectId, project] of Object.entries(projectsData.projects)) {
+      if (!await canAccessProject(req.user.id, projectId)) continue;
+      
+      try {
+        const content = await fs.readFile(project.file, 'utf8');
+        const data = parseKanban(content);
+        
+        const reviewCol = data.columns.find(c => c.title.includes('Review'));
+        if (!reviewCol) continue;
+        
+        for (const task of reviewCol.tasks) {
+          // Extract images from HTML comment
+          const imgMatch = task.content.match(/<!-- images: (.+?) -->/);
+          const images = imgMatch ? imgMatch[1].split(',').map(s => s.trim()) : [];
+          
+          // Extract confidence
+          const confMatch = task.content.match(/\*\*Confidence\*\*:\s*(\w+)/);
+          
+          reviews.push({
+            ...task,
+            displayId: buildDisplayId(task.id, projectId),
+            _project: projectId,
+            _projectName: project.name,
+            images,
+            confidence: confMatch ? confMatch[1] : null,
+          });
+        }
+      } catch (err) {
+        console.error(`Failed to read ${projectId}:`, err.message);
+      }
+    }
+    
+    res.json({ reviews });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/reviews/:taskId/approve — move to Done
+app.post('/api/reviews/:taskId/approve', authMiddleware, async (req, res) => {
+  try {
+    const { project } = req.body;
+    if (!project) return res.status(400).json({ error: 'project required' });
+    if (!await canEditProject(req.user.id, project)) {
+      return res.status(403).json({ error: 'No edit access' });
+    }
+    
+    const projectsData = await loadProjects();
+    const proj = projectsData.projects[project];
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+    
+    const taskId = normalizeTaskId(req.params.taskId, project);
+    
+    return withFileLock(proj.file, async () => {
+      const content = await fs.readFile(proj.file, 'utf8');
+      const data = parseKanban(content);
+      
+      const reviewCol = data.columns.find(c => c.title.includes('Review'));
+      if (!reviewCol) return res.status(404).json({ error: 'Review column not found' });
+      
+      const taskIndex = reviewCol.tasks.findIndex(t => t.id === taskId);
+      if (taskIndex === -1) return res.status(404).json({ error: 'Task not found in Review' });
+      
+      const [task] = reviewCol.tasks.splice(taskIndex, 1);
+      
+      const doneCol = data.columns.find(c => c.title.includes('Done'));
+      if (!doneCol) return res.status(404).json({ error: 'Done column not found' });
+      
+      // Add audit trail
+      const now = new Date().toISOString().replace('T', ' ').slice(0, 16);
+      const auditEntry = `${now} | ${req.user.name} approved (moved to Done)`;
+      const historyMatch = task.content.match(/<!-- History:\n([\s\S]*?)-->/);
+      if (historyMatch) {
+        task.content = task.content.replace(
+          /<!-- History:\n[\s\S]*?-->/,
+          `<!-- History:\n${historyMatch[1]}${auditEntry}\n-->`
+        );
+      } else {
+        task.content = task.content.trim() + `\n\n<!-- History:\n${auditEntry}\n-->`;
+      }
+      
+      // Add closed by
+      const today = new Date().toISOString().split('T')[0];
+      if (!task.content.includes('**Closed**:')) {
+        const lines = task.content.split('\n');
+        let insertIdx = 0;
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].startsWith('**')) insertIdx = i + 1;
+        }
+        lines.splice(insertIdx, 0, `**Closed**: ${today} by ${req.user.name}`);
+        task.content = lines.join('\n');
+      }
+      
+      doneCol.tasks.unshift(task);
+      
+      const newContent = rebuildKanban(data, content);
+      await fs.writeFile(proj.file, newContent);
+      res.json({ ok: true });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/reviews/:taskId/reject — move back to In Progress
+app.post('/api/reviews/:taskId/reject', authMiddleware, async (req, res) => {
+  try {
+    const { project } = req.body;
+    if (!project) return res.status(400).json({ error: 'project required' });
+    if (!await canEditProject(req.user.id, project)) {
+      return res.status(403).json({ error: 'No edit access' });
+    }
+    
+    const projectsData = await loadProjects();
+    const proj = projectsData.projects[project];
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+    
+    const taskId = normalizeTaskId(req.params.taskId, project);
+    
+    return withFileLock(proj.file, async () => {
+      const content = await fs.readFile(proj.file, 'utf8');
+      const data = parseKanban(content);
+      
+      const reviewCol = data.columns.find(c => c.title.includes('Review'));
+      if (!reviewCol) return res.status(404).json({ error: 'Review column not found' });
+      
+      const taskIndex = reviewCol.tasks.findIndex(t => t.id === taskId);
+      if (taskIndex === -1) return res.status(404).json({ error: 'Task not found in Review' });
+      
+      const [task] = reviewCol.tasks.splice(taskIndex, 1);
+      
+      const ipCol = data.columns.find(c => c.title.includes('In Progress'));
+      if (!ipCol) return res.status(404).json({ error: 'In Progress column not found' });
+      
+      const now = new Date().toISOString().replace('T', ' ').slice(0, 16);
+      const feedback = req.body.feedback || '';
+      const auditEntry = `${now} | ${req.user.name} rejected${feedback ? ': ' + feedback : ''}`;
+      const historyMatch = task.content.match(/<!-- History:\n([\s\S]*?)-->/);
+      if (historyMatch) {
+        task.content = task.content.replace(
+          /<!-- History:\n[\s\S]*?-->/,
+          `<!-- History:\n${historyMatch[1]}${auditEntry}\n-->`
+        );
+      } else {
+        task.content = task.content.trim() + `\n\n<!-- History:\n${auditEntry}\n-->`;
+      }
+      
+      ipCol.tasks.unshift(task);
+      
+      const newContent = rebuildKanban(data, content);
+      await fs.writeFile(proj.file, newContent);
+      res.json({ ok: true });
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/reviews/:taskId/chat — AI chat about a task
+app.post('/api/reviews/:taskId/chat', authMiddleware, async (req, res) => {
+  try {
+    const { project, message } = req.body;
+    if (!project || !message) return res.status(400).json({ error: 'project and message required' });
+    
+    const taskId = normalizeTaskId(req.params.taskId, project);
+    const chatFile = path.join(CHATS_DIR, `${project}-${taskId}.json`);
+    
+    // Load chat history
+    let history = [];
+    try {
+      const data = await fs.readFile(chatFile, 'utf8');
+      history = JSON.parse(data);
+    } catch {}
+    
+    // Get task details
+    const projectsData = await loadProjects();
+    const proj = projectsData.projects[project];
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+    
+    const content = await fs.readFile(proj.file, 'utf8');
+    const kanbanData = parseKanban(content);
+    let taskContent = '';
+    for (const col of kanbanData.columns) {
+      const task = col.tasks.find(t => t.id === taskId);
+      if (task) { taskContent = task.content; break; }
+    }
+    
+    // Load project brief
+    let briefContent = '';
+    try {
+      briefContent = await fs.readFile(path.join(BRIEFS_DIR, `${project}.md`), 'utf8');
+    } catch {}
+    
+    // Add user message to history
+    history.push({ role: 'user', content: message, timestamp: new Date().toISOString() });
+    
+    // Build messages for Anthropic
+    const systemPrompt = `You are a helpful assistant reviewing a task on a kanban board. Here's the context:
+
+## Task Details
+${taskContent}
+
+## Project Brief
+${briefContent || 'No brief available.'}
+
+Answer questions about this task concisely. Help with review decisions, suggest improvements, or discuss implementation details.`;
+    
+    const apiMessages = history
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map(m => ({ role: m.role, content: m.content }));
+    
+    // Call OpenRouter API (OpenAI-compatible)
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) {
+      const reply = 'Chat AI not configured. Set OPENROUTER_API_KEY in server/.env';
+      history.push({ role: 'assistant', content: reply, timestamp: new Date().toISOString() });
+      await fs.writeFile(chatFile, JSON.stringify(history, null, 2));
+      return res.json({ reply, history });
+    }
+    
+    const apiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: 'anthropic/claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...apiMessages,
+        ],
+      }),
+    });
+    
+    if (!apiRes.ok) {
+      const errText = await apiRes.text();
+      console.error('OpenRouter API error:', errText);
+      return res.status(502).json({ error: 'AI service error' });
+    }
+    
+    const aiData = await apiRes.json();
+    const reply = aiData.choices?.[0]?.message?.content || 'No response';
+    
+    history.push({ role: 'assistant', content: reply, timestamp: new Date().toISOString() });
+    await fs.writeFile(chatFile, JSON.stringify(history, null, 2));
+    
+    res.json({ reply, history });
+  } catch (err) {
+    console.error('Chat error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/reviews/:taskId/chat — get chat history
+app.get('/api/reviews/:taskId/chat', authMiddleware, async (req, res) => {
+  const project = req.query.project;
+  if (!project) return res.status(400).json({ error: 'project query param required' });
+  const taskId = normalizeTaskId(req.params.taskId, project);
+  const chatFile = path.join(CHATS_DIR, `${project}-${taskId}.json`);
+  
+  try {
+    const data = await fs.readFile(chatFile, 'utf8');
+    res.json({ history: JSON.parse(data) });
+  } catch {
+    res.json({ history: [] });
+  }
+});
+
+// POST /api/reviews/:taskId/images — upload image to task
+app.post('/api/reviews/:taskId/images', authMiddleware, async (req, res) => {
+  try {
+    const { project } = req.body || {};
+    
+    // Handle multipart - we need to parse it manually since we don't have multer
+    // Actually let's add basic file handling
+    const contentType = req.headers['content-type'] || '';
+    
+    if (!contentType.includes('multipart')) {
+      return res.status(400).json({ error: 'multipart/form-data required' });
+    }
+    
+    // We'll handle this with a simpler approach - base64 upload
+    return res.status(501).json({ error: 'Use /api/upload endpoint instead' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Simple base64 image upload endpoint
+app.post('/api/upload', authMiddleware, express.json({ limit: '10mb' }), async (req, res) => {
+  try {
+    const { data, filename, project, taskId } = req.body;
+    if (!data || !filename) return res.status(400).json({ error: 'data and filename required' });
+    
+    const ext = path.extname(filename) || '.png';
+    const safeName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`;
+    const filePath = path.join(UPLOADS_DIR, safeName);
+    
+    // Decode base64
+    const base64Data = data.replace(/^data:image\/\w+;base64,/, '');
+    await fs.writeFile(filePath, Buffer.from(base64Data, 'base64'));
+    
+    // If taskId and project provided, add image reference to task
+    if (taskId && project) {
+      const normalizedId = normalizeTaskId(taskId, project);
+      const projectsData = await loadProjects();
+      const proj = projectsData.projects[project];
+      if (proj) {
+        await withFileLock(proj.file, async () => {
+          let content = await fs.readFile(proj.file, 'utf8');
+          const imgComment = `<!-- images: /uploads/${safeName} -->`;
+          
+          // Find task and add/update images comment
+          const taskRegex = new RegExp(`(### ${normalizedId} \\| [^\\n]+)`);
+          const existingImgRegex = new RegExp(`(### ${normalizedId} \\| [\\s\\S]*?)<!-- images: ([^>]+) -->`);
+          const existingMatch = content.match(existingImgRegex);
+          
+          if (existingMatch) {
+            const existingImages = existingMatch[2];
+            content = content.replace(
+              `<!-- images: ${existingImages} -->`,
+              `<!-- images: ${existingImages}, /uploads/${safeName} -->`
+            );
+          } else {
+            // Add after task header line
+            content = content.replace(taskRegex, `$1\n<!-- images: /uploads/${safeName} -->`);
+          }
+          
+          await fs.writeFile(proj.file, content);
+        });
+      }
+    }
+    
+    res.json({ ok: true, url: `/uploads/${safeName}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
