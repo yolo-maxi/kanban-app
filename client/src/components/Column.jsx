@@ -10,7 +10,7 @@ function Column({ column, onAddTask, onEditTask, showProject }) {
   return (
     <div className={`column ${isOver ? 'column-over' : ''}`}>
       <div className="column-header">
-        <h2>{column.title}</h2>
+        <h2 className="column-title">{column.title}</h2>
         <div className="column-actions">
           <span className="task-count">{column.tasks.length}</span>
           <button className="add-task-btn" onClick={onAddTask}>+</button>
